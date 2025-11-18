@@ -1,0 +1,507 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>NFC Bridge Service Test</title>
+    <script src="https://cdn.socket.io/4.7.2/socket.io.min.js"></script>
+    <style>
+        * {
+            margin: 0;
+            padding: 0;
+            box-sizing: border-box;
+        }
+
+        body {
+            font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, 'Helvetica Neue', Arial, sans-serif;
+            min-height: 100vh;
+            display: flex;
+            justify-content: center;
+            align-items: center;
+            padding: 20px;
+        }
+
+        .container {
+            background: white;
+            border-radius: 20px;
+            box-shadow: 0 20px 60px rgba(0, 0, 0, 0.3);
+            max-width: 600px;
+            width: 100%;
+            padding: 40px;
+        }
+
+        h1 {
+            color: #333;
+            margin-bottom: 10px;
+            font-size: 28px;
+        }
+
+        .subtitle {
+            color: #666;
+            margin-bottom: 30px;
+            font-size: 14px;
+        }
+
+        .status-indicator {
+            display: flex;
+            align-items: center;
+            gap: 10px;
+            padding: 15px;
+            border-radius: 10px;
+            margin-bottom: 20px;
+            font-weight: 500;
+        }
+
+        .status-dot {
+            width: 12px;
+            height: 12px;
+            border-radius: 50%;
+            animation: pulse 2s ease-in-out infinite;
+        }
+
+        @keyframes pulse {
+            0%, 100% { opacity: 1; }
+            50% { opacity: 0.5; }
+        }
+
+        .status-connected {
+            background: #d4edda;
+            border: 2px solid #28a745;
+            color: #155724;
+        }
+
+        .status-connected .status-dot {
+            background: #28a745;
+        }
+
+        .status-disconnected {
+            background: #f8d7da;
+            border: 2px solid #dc3545;
+            color: #721c24;
+        }
+
+        .status-disconnected .status-dot {
+            background: #dc3545;
+        }
+
+        .status-scanning {
+            background: #d1ecf1;
+            border: 2px solid #17a2b8;
+            color: #0c5460;
+        }
+
+        .status-scanning .status-dot {
+            background: #17a2b8;
+        }
+
+        .card-display {
+            background: #EDEDED;
+            border-radius: 15px;
+            padding: 30px;
+            margin: 20px 0;
+            color: black;
+            min-height: 120px;
+            display: flex;
+            flex-direction: column;
+            justify-content: center;
+            align-items: center;
+        }
+
+        .card-label {
+            font-size: 12px;
+            opacity: 0.9;
+            text-transform: uppercase;
+            letter-spacing: 1px;
+            margin-bottom: 10px;
+        }
+
+        .card-id {
+            font-size: 24px;
+            font-weight: bold;
+            font-family: 'Courier New', monospace;
+            word-break: break-all;
+            text-align: center;
+        }
+
+        .card-method {
+            font-size: 11px;
+            opacity: 0.8;
+            margin-top: 10px;
+        }
+
+        .no-card {
+            opacity: 0.6;
+            font-style: italic;
+        }
+
+        .button {
+            width: 100%;
+            padding: 15px;
+            border: none;
+            border-radius: 10px;
+            font-size: 16px;
+            font-weight: 600;
+            cursor: pointer;
+            transition: all 0.3s ease;
+            margin-bottom: 10px;
+        }
+
+        .button:hover {
+            transform: translateY(-2px);
+            box-shadow: 0 5px 15px rgba(0, 0, 0, 0.2);
+        }
+
+        .button:active {
+            transform: translateY(0);
+        }
+
+        .button-primary {
+            background: #28a745;
+            color: white;
+        }
+
+        .button-primary:hover {
+            background: #218838;
+        }
+
+        .button-danger {
+            background: #dc3545;
+            color: white;
+        }
+
+        .button-danger:hover {
+            background: #c82333;
+        }
+
+        .button-secondary {
+            background: #6c757d;
+            color: white;
+        }
+
+        .button-secondary:hover {
+            background: #5a6268;
+        }
+
+        .button:disabled {
+            opacity: 0.5;
+            cursor: not-allowed;
+            transform: none !important;
+        }
+
+        .log-container {
+            background: #f8f9fa;
+            border-radius: 10px;
+            padding: 15px;
+            max-height: 200px;
+            overflow-y: auto;
+            margin-top: 20px;
+        }
+
+        .log-title {
+            font-weight: 600;
+            margin-bottom: 10px;
+            color: #333;
+        }
+
+        .log-entry {
+            font-size: 12px;
+            font-family: 'Courier New', monospace;
+            padding: 5px;
+            border-left: 3px solid #667eea;
+            margin-bottom: 5px;
+            padding-left: 10px;
+            color: #555;
+        }
+
+        .log-entry.success {
+            border-left-color: #28a745;
+            color: #155724;
+        }
+
+        .log-entry.error {
+            border-left-color: #dc3545;
+            color: #721c24;
+        }
+
+        .log-entry.info {
+            border-left-color: #17a2b8;
+            color: #0c5460;
+        }
+
+        .reader-info {
+            background: #e7f3ff;
+            border-left: 4px solid #2196F3;
+            padding: 12px;
+            border-radius: 5px;
+            margin-bottom: 20px;
+            font-size: 14px;
+            color: #0d47a1;
+        }
+
+        .success-animation {
+            animation: successPulse 0.6s ease-out;
+        }
+
+        @keyframes successPulse {
+            0% { transform: scale(1); }
+            50% { transform: scale(1.05); }
+            100% { transform: scale(1); }
+        }
+
+        .spinner {
+            display: inline-block;
+            width: 14px;
+            height: 14px;
+            border: 2px solid rgba(255, 255, 255, 0.3);
+            border-radius: 50%;
+            border-top-color: white;
+            animation: spin 0.8s linear infinite;
+        }
+
+        @keyframes spin {
+            to { transform: rotate(360deg); }
+        }
+    </style>
+</head>
+<body>
+    <div class="container">
+        <h1>USB NFC Bridge Service Test</h1>
+
+        <!-- Connection Status -->
+        <div id="connectionStatus" class="status-indicator status-disconnected">
+            <div class="status-dot"></div>
+            <span>Disconnected from bridge service</span>
+        </div>
+
+        <!-- Reader Info -->
+        <div id="readerInfo" class="reader-info" style="display: none;">
+            <strong>Reader:</strong> <span id="readerName">Checking...</span>
+        </div>
+
+        <!-- Card Display -->
+        <div class="card-display" id="cardDisplay">
+            <div class="card-label">NFC CARD ID</div>
+            <div class="card-id no-card">No card scanned</div>
+            <div class="card-method"></div>
+        </div>
+
+        <!-- Control Buttons -->
+        <button id="startBtn" class="button button-primary" onclick="startScan()" disabled>
+            Start Scanning
+        </button>
+        <button id="stopBtn" class="button button-danger" onclick="stopScan()" disabled style="display: none;">
+            Stop Scanning
+        </button>
+        <button id="checkBtn" class="button button-secondary" onclick="checkReader()" disabled>
+            Check Reader Status
+        </button>
+
+        <!-- Activity Log -->
+        <div class="log-container">
+            <div class="log-title">Activity Log</div>
+            <div id="logContent">
+                <div class="log-entry">Waiting for connection...</div>
+            </div>
+        </div>
+    </div>
+
+    <script>
+        let socket = null;
+        let isScanning = false;
+
+        // Connect to bridge service
+        function connectToBridge() {
+            addLog('Connecting to bridge service at localhost:5000...', 'info');
+            
+            socket = io('http://localhost:5000', {
+                transports: ['websocket', 'polling'],
+                reconnection: true,
+                reconnectionDelay: 1000,
+                reconnectionAttempts: 5
+            });
+
+            socket.on('connect', () => {
+                addLog('Connected to bridge service!', 'success');
+                updateConnectionStatus(true);
+                document.getElementById('startBtn').disabled = false;
+                document.getElementById('checkBtn').disabled = false;
+                
+                // Automatically check reader on connect
+                checkReader();
+            });
+
+            socket.on('disconnect', () => {
+                addLog('Disconnected from bridge service', 'error');
+                updateConnectionStatus(false);
+                document.getElementById('startBtn').disabled = true;
+                document.getElementById('checkBtn').disabled = true;
+                document.getElementById('readerInfo').style.display = 'none';
+            });
+
+            socket.on('connected', (data) => {
+                addLog('Bridge service ready: ' + data.message, 'success');
+            });
+
+            socket.on('card_detected', (data) => {
+                addLog('CARD DETECTED: ' + data.serialNumber, 'success');
+                displayCard(data.serialNumber, data.method);
+                
+                // Play success sound (optional)
+                playSuccessSound();
+            });
+
+            socket.on('card_removed', () => {
+                addLog('Card removed from reader', 'info');
+            });
+
+            socket.on('status', (data) => {
+                addLog('Status: ' + data.message, 'info');
+                if (data.scanning) {
+                    updateScanningStatus(true);
+                } else {
+                    updateScanningStatus(false);
+                }
+            });
+
+            socket.on('error', (data) => {
+                addLog('Error: ' + data.message, 'error');
+                updateScanningStatus(false);
+            });
+
+            socket.on('reader_status', (data) => {
+                if (data.available) {
+                    addLog('Rader found: ' + data.reader, 'success');
+                    document.getElementById('readerInfo').style.display = 'block';
+                    document.getElementById('readerName').textContent = data.reader;
+                } else {
+                    addLog('No reader found. Please connect ACR1222L', 'error');
+                    document.getElementById('readerInfo').style.display = 'none';
+                }
+            });
+
+            socket.on('connect_error', (error) => {
+                addLog('Connection error: ' + error.message, 'error');
+                addLog('Make sure bridge service is running: python app.py', 'error');
+            });
+        }
+
+        function startScan() {
+            if (!socket || !socket.connected) {
+                addLog('Not connected to bridge service', 'error');
+                return;
+            }
+
+            addLog('Starting scan...', 'info');
+            socket.emit('start_scan');
+            isScanning = true;
+            updateScanningStatus(true);
+        }
+
+        function stopScan() {
+            if (!socket || !socket.connected) {
+                return;
+            }
+
+            addLog('Stopping scan...', 'info');
+            socket.emit('stop_scan');
+            isScanning = false;
+            updateScanningStatus(false);
+        }
+
+        function checkReader() {
+            if (!socket || !socket.connected) {
+                addLog('Not connected to bridge service', 'error');
+                return;
+            }
+
+            addLog('Checking reader...', 'info');
+            socket.emit('check_reader');
+        }
+
+        function updateConnectionStatus(connected) {
+            const statusEl = document.getElementById('connectionStatus');
+            if (connected) {
+                statusEl.className = 'status-indicator status-connected';
+                statusEl.innerHTML = '<div class="status-dot"></div><span>Connected to bridge service</span>';
+            } else {
+                statusEl.className = 'status-indicator status-disconnected';
+                statusEl.innerHTML = '<div class="status-dot"></div><span>Disconnected from bridge service</span>';
+            }
+        }
+
+        function updateScanningStatus(scanning) {
+            const statusEl = document.getElementById('connectionStatus');
+            const startBtn = document.getElementById('startBtn');
+            const stopBtn = document.getElementById('stopBtn');
+            
+            if (scanning) {
+                statusEl.className = 'status-indicator status-scanning';
+                statusEl.innerHTML = '<div class="status-dot"></div><div class="spinner"></div><span>🔍 Scanning for cards... Place card on reader</span>';
+                startBtn.style.display = 'none';
+                stopBtn.style.display = 'block';
+                stopBtn.disabled = false;
+            } else {
+                updateConnectionStatus(socket && socket.connected);
+                startBtn.style.display = 'block';
+                stopBtn.style.display = 'none';
+            }
+        }
+
+        function displayCard(cardId, method) {
+            const cardDisplay = document.getElementById('cardDisplay');
+            cardDisplay.innerHTML = `
+                <div class="card-label">CARD DETECTED</div>
+                <div class="card-id">${cardId}</div>
+                <div class="card-method">via ${method || 'USB Bridge'}</div>
+            `;
+            cardDisplay.classList.add('success-animation');
+            setTimeout(() => {
+                cardDisplay.classList.remove('success-animation');
+            }, 600);
+        }
+
+        function addLog(message, type = '') {
+            const logContent = document.getElementById('logContent');
+            const timestamp = new Date().toLocaleTimeString();
+            const entry = document.createElement('div');
+            entry.className = 'log-entry ' + type;
+            entry.textContent = `[${timestamp}] ${message}`;
+            
+            logContent.insertBefore(entry, logContent.firstChild);
+            
+            // Keep only last 20 entries
+            while (logContent.children.length > 20) {
+                logContent.removeChild(logContent.lastChild);
+            }
+        }
+
+        function playSuccessSound() {
+            // Simple beep using Web Audio API
+            try {
+                const audioContext = new (window.AudioContext || window.webkitAudioContext)();
+                const oscillator = audioContext.createOscillator();
+                const gainNode = audioContext.createGain();
+                
+                oscillator.connect(gainNode);
+                gainNode.connect(audioContext.destination);
+                
+                oscillator.frequency.value = 800;
+                oscillator.type = 'sine';
+                
+                gainNode.gain.setValueAtTime(0.3, audioContext.currentTime);
+                gainNode.gain.exponentialRampToValueAtTime(0.01, audioContext.currentTime + 0.5);
+                
+                oscillator.start(audioContext.currentTime);
+                oscillator.stop(audioContext.currentTime + 0.5);
+            } catch (e) {
+                // Ignore audio errors
+            }
+        }
+
+        // Auto-connect on page load
+        window.addEventListener('load', () => {
+            connectToBridge();
+        });
+    </script>
+</body>
+</html>
