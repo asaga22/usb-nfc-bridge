@@ -89,3 +89,4 @@ alembic/
 
 # Ignore Flask instance folder
 instance/
+venv
