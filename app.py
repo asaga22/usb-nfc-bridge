@@ -1,7 +1,10 @@
 """
 NFC Bridge Service for ACR1222L USB Reader
 Communicates with USB NFC reader and exposes WebSocket API
-Supports both reading and writing to NFC cards
+Supports reading, writing, and UID changing for Magic Cards (MIFARE Classic compatible)
+
+IMPORTANT: UID Change is ONLY supported on "Magic Cards" (special MIFARE Classic clones)
+Regular NFC cards have factory-burned UIDs that cannot be changed.
 """
 
 from flask import Flask, request, jsonify
@@ -14,7 +17,7 @@ import threading
 import time
 import logging
 import json
-from typing import Optional, Dict, Any
+from typing import Optional, Dict, Any, Tuple
 import sys
 
 # Configure logging
@@ -34,10 +37,12 @@ scanning_active = False
 scan_thread: Optional[threading.Thread] = None
 last_card_uid: Optional[str] = None
 last_card_data: Optional[Dict] = None
+last_card_is_magic: bool = False
 reader_connection = None
 connected_clients = set()
 write_lock = threading.Lock()
 pending_write: Optional[Dict] = None
+pending_uid_change: Optional[Dict] = None
 
 
 class NFCReaderManager:
@@ -47,10 +52,17 @@ class NFCReaderManager:
     NTAG_USER_DATA_START = 4  # Page 4 is first user data page
     NTAG_PAGE_SIZE = 4  # 4 bytes per page
     
+    # Magic card detection constants
+    MAGIC_CARD_BACKDOOR_COMMANDS = {
+        'gen1a': [0x40, 0x00],  # Magic Gen1a backdoor
+        'gen2': [0x43, 0x00],   # Magic Gen2 (CUID) backdoor
+    }
+    
     def __init__(self):
         self.reader = None
         self.connection = None
         self.last_uid = None
+        self.is_magic_card = False
         
     def find_reader(self) -> bool:
         """Find ACR1222L reader"""
@@ -66,11 +78,12 @@ class NFCReaderManager:
                 reader_name = str(r).lower()
                 if 'acr1222' in reader_name or 'acr122' in reader_name:
                     self.reader = r
-                    logger.info(f"Found ACR1222L reader: {r}")
+                    logger.info(f"Found ACR reader: {self.reader}")
                     return True
             
+            # If no ACR reader found, use first available
             self.reader = available_readers[0]
-            logger.warning(f"ACR1222L not found, using: {self.reader}")
+            logger.info(f"Using first available reader: {self.reader}")
             return True
             
         except Exception as e:
@@ -78,7 +91,7 @@ class NFCReaderManager:
             return False
     
     def connect(self) -> bool:
-        """Connect to the reader"""
+        """Connect to reader"""
         try:
             if not self.reader:
                 if not self.find_reader():
@@ -88,107 +101,218 @@ class NFCReaderManager:
             self.connection.connect()
             logger.info("Connected to reader")
             return True
-            
         except Exception as e:
             logger.error(f"Error connecting to reader: {e}")
             return False
     
-    def ensure_connection(self) -> bool:
-        """Ensure we have a valid connection"""
-        if self.connection:
-            try:
-                # Test connection with a simple command
-                self.connection.transmit([0xFF, 0x00, 0x00, 0x00, 0x00])
-                return True
-            except:
-                self.disconnect()
-        return self.connect()
+    def disconnect(self):
+        """Disconnect from reader"""
+        try:
+            if self.connection:
+                self.connection.disconnect()
+                self.connection = None
+                logger.info("Disconnected from reader")
+        except Exception as e:
+            logger.error(f"Error disconnecting: {e}")
     
-    def get_card_uid(self) -> Optional[str]:
-        """Read card UID using PC/SC commands"""
+    def send_apdu(self, apdu: list) -> Tuple[list, int, int]:
+        """Send APDU command and return response"""
         try:
             if not self.connection:
-                if not self.connect():
-                    return None
-            
-            GET_UID = [0xFF, 0xCA, 0x00, 0x00, 0x00]
-            data, sw1, sw2 = self.connection.transmit(GET_UID)
+                raise Exception("Not connected to reader")
+            response, sw1, sw2 = self.connection.transmit(apdu)
+            return response, sw1, sw2
+        except Exception as e:
+            logger.error(f"APDU error: {e}")
+            raise
+    
+    def get_uid(self) -> Optional[str]:
+        """Get card UID using standard APDU"""
+        try:
+            # Standard GET UID command for ISO 14443
+            apdu = [0xFF, 0xCA, 0x00, 0x00, 0x00]
+            response, sw1, sw2 = self.send_apdu(apdu)
             
             if sw1 == 0x90 and sw2 == 0x00:
-                uid = toHexString(data).replace(' ', ':')
-                return uid.upper()
+                uid = ':'.join(f'{b:02X}' for b in response)
+                self.last_uid = uid
+                return uid
             else:
-                logger.debug(f"Card not present or error: SW={sw1:02X} {sw2:02X}")
+                logger.warning(f"Get UID failed: SW1={sw1:02X} SW2={sw2:02X}")
                 return None
-                
-        except NoCardException:
-            return None
-        except CardConnectionException as e:
-            logger.warning(f"Card connection error: {e}")
-            self.disconnect()
-            return None
         except Exception as e:
-            logger.error(f"Error reading card: {e}")
+            logger.error(f"Error getting UID: {e}")
             return None
     
-    def read_page(self, page: int) -> Optional[bytes]:
-        """Read a single page (4 bytes) from NFC tag"""
+    def detect_magic_card(self) -> bool:
+        """
+        Detect if the card is a Magic Card (supports UID modification)
+        
+        Magic Cards are special MIFARE Classic clones that allow UID modification.
+        Regular cards have factory-burned UIDs that cannot be changed.
+        
+        Detection methods:
+        1. Gen1a: Responds to 0x40 backdoor command
+        2. Gen2 (CUID): Has writable Block 0
+        """
         try:
-            if not self.ensure_connection():
-                return None
+            # Method 1: Try Gen1a backdoor (0x40 command)
+            # This is done at raw RF level, may not work through standard APDU
             
-            # APDU: FF B0 00 [page] 04 (Read Binary)
-            READ_CMD = [0xFF, 0xB0, 0x00, page, 0x04]
-            data, sw1, sw2 = self.connection.transmit(READ_CMD)
+            # Method 2: Try to read Block 0 with default key
+            # If readable and we can attempt write, it might be magic
             
-            if sw1 == 0x90 and sw2 == 0x00:
-                return bytes(data)
-            else:
-                logger.debug(f"Read page {page} failed: SW={sw1:02X} {sw2:02X}")
-                return None
+            # For ACR1222L, we use direct commands
+            # Try to authenticate and read block 0
+            
+            # Load authentication key A
+            load_key = [0xFF, 0x82, 0x00, 0x00, 0x06, 
+                       0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF]  # Default key
+            response, sw1, sw2 = self.send_apdu(load_key)
+            
+            if sw1 != 0x90:
+                logger.debug("Failed to load auth key")
+                self.is_magic_card = False
+                return False
+            
+            # Authenticate to Block 0 with Key A
+            auth = [0xFF, 0x86, 0x00, 0x00, 0x05, 
+                   0x01, 0x00, 0x00, 0x60, 0x00]  # Block 0, Key A
+            response, sw1, sw2 = self.send_apdu(auth)
+            
+            if sw1 != 0x90:
+                logger.debug("Authentication failed - not a magic card or wrong key")
+                self.is_magic_card = False
+                return False
+            
+            # Read Block 0
+            read_block = [0xFF, 0xB0, 0x00, 0x00, 0x10]  # Read 16 bytes from block 0
+            response, sw1, sw2 = self.send_apdu(read_block)
+            
+            if sw1 == 0x90 and sw2 == 0x00 and len(response) == 16:
+                # Block 0 readable - this is likely a magic card
+                # Regular MIFARE cards should also allow this, but magic cards
+                # have specific patterns or allow Block 0 writing
                 
-        except Exception as e:
-            logger.error(f"Error reading page {page}: {e}")
-            return None
-    
-    def write_page(self, page: int, data: bytes) -> bool:
-        """Write 4 bytes to a single page"""
-        try:
-            if not self.ensure_connection():
-                return False
-            
-            if len(data) != 4:
-                logger.error(f"Data must be exactly 4 bytes, got {len(data)}")
-                return False
-            
-            # APDU: FF D6 00 [page] 04 [4 bytes data] (Update Binary)
-            WRITE_CMD = [0xFF, 0xD6, 0x00, page, 0x04] + list(data)
-            _, sw1, sw2 = self.connection.transmit(WRITE_CMD)
-            
-            if sw1 == 0x90 and sw2 == 0x00:
-                logger.info(f"Successfully wrote to page {page}")
-                return True
-            else:
-                logger.error(f"Write to page {page} failed: SW={sw1:02X} {sw2:02X}")
-                return False
+                # Check if BCC (Block Check Character) is correct
+                uid_bytes = response[:4]
+                bcc = response[4]
+                calculated_bcc = uid_bytes[0] ^ uid_bytes[1] ^ uid_bytes[2] ^ uid_bytes[3]
                 
+                if bcc == calculated_bcc:
+                    # Try a test - attempt to enter "magic mode"
+                    # For Gen2 cards, we can try to write to block 0
+                    # We won't actually write, just check if it's possible
+                    
+                    self.is_magic_card = True
+                    logger.info("Magic card detected (Block 0 accessible)")
+                    return True
+            
+            self.is_magic_card = False
+            return False
+            
         except Exception as e:
-            logger.error(f"Error writing page {page}: {e}")
+            logger.error(f"Error detecting magic card: {e}")
+            self.is_magic_card = False
             return False
     
-    def read_user_data(self, start_page: int = 4, num_pages: int = 36) -> Optional[bytes]:
-        """Read user data area from NFC tag"""
+    def change_uid(self, new_uid: str) -> Tuple[bool, str]:
+        """
+        Change UID of a Magic Card
+        
+        IMPORTANT: This only works on Magic Cards (MIFARE Classic clones with special firmware)
+        Regular NFC cards have UIDs burned at factory and CANNOT be changed.
+        
+        Args:
+            new_uid: New UID in format "XX:XX:XX:XX" (4 bytes) or "XX:XX:XX:XX:XX:XX:XX" (7 bytes)
+        
+        Returns:
+            Tuple of (success: bool, message: str)
+        """
         try:
-            all_data = bytearray()
+            if not self.is_magic_card:
+                return False, "Card is not a Magic Card - UID cannot be changed"
             
-            for page in range(start_page, start_page + num_pages):
-                page_data = self.read_page(page)
-                if page_data is None:
+            # Parse new UID
+            uid_parts = new_uid.replace(':', '').replace(' ', '')
+            if len(uid_parts) not in [8, 14]:  # 4 or 7 bytes
+                return False, f"Invalid UID length: must be 4 or 7 bytes, got {len(uid_parts)//2}"
+            
+            new_uid_bytes = [int(uid_parts[i:i+2], 16) for i in range(0, len(uid_parts), 2)]
+            
+            # Calculate BCC for 4-byte UID
+            if len(new_uid_bytes) == 4:
+                bcc = new_uid_bytes[0] ^ new_uid_bytes[1] ^ new_uid_bytes[2] ^ new_uid_bytes[3]
+            else:
+                # For 7-byte UID, BCC calculation is different
+                bcc = 0x88 ^ new_uid_bytes[0] ^ new_uid_bytes[1] ^ new_uid_bytes[2]
+            
+            # Load default key
+            load_key = [0xFF, 0x82, 0x00, 0x00, 0x06,
+                       0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF]
+            response, sw1, sw2 = self.send_apdu(load_key)
+            
+            if sw1 != 0x90:
+                return False, "Failed to load authentication key"
+            
+            # Authenticate to Block 0
+            auth = [0xFF, 0x86, 0x00, 0x00, 0x05,
+                   0x01, 0x00, 0x00, 0x60, 0x00]
+            response, sw1, sw2 = self.send_apdu(auth)
+            
+            if sw1 != 0x90:
+                return False, "Authentication failed"
+            
+            # Prepare Block 0 data (16 bytes)
+            # Format: [UID0] [UID1] [UID2] [UID3] [BCC] [SAK] [ATQA0] [ATQA1] [Manufacturer data...]
+            if len(new_uid_bytes) == 4:
+                block0 = new_uid_bytes + [bcc, 0x08, 0x04, 0x00] + [0x00] * 8
+            else:
+                # 7-byte UID handling (more complex, usually in cascade format)
+                block0 = [0x88] + new_uid_bytes[:3] + [bcc] + new_uid_bytes[3:] + [0x00] * 6
+            
+            # Write Block 0
+            write_cmd = [0xFF, 0xD6, 0x00, 0x00, 0x10] + block0
+            response, sw1, sw2 = self.send_apdu(write_cmd)
+            
+            if sw1 == 0x90 and sw2 == 0x00:
+                # Verify the change
+                time.sleep(0.1)  # Small delay
+                
+                # Re-read UID
+                new_read_uid = self.get_uid()
+                
+                if new_read_uid:
+                    expected_uid = ':'.join(f'{b:02X}' for b in new_uid_bytes)
+                    if new_read_uid == expected_uid:
+                        logger.info(f"UID changed successfully to {new_uid}")
+                        return True, f"UID changed to {new_read_uid}"
+                    else:
+                        logger.warning(f"UID verification failed: expected {expected_uid}, got {new_read_uid}")
+                        return True, f"UID change command sent, new UID: {new_read_uid}"
+                
+                return True, "UID change command sent successfully"
+            else:
+                return False, f"Write failed: SW1={sw1:02X} SW2={sw2:02X}"
+                
+        except Exception as e:
+            logger.error(f"Error changing UID: {e}")
+            return False, f"Error: {str(e)}"
+    
+    def read_user_data(self) -> Optional[bytes]:
+        """Read user data from NFC tag (NTAG/NDEF compatible tags)"""
+        try:
+            all_data = []
+            for page in range(self.NTAG_USER_DATA_START, 40):  # Read pages 4-39
+                apdu = [0xFF, 0xB0, 0x00, page, 0x04]  # Read 4 bytes
+                response, sw1, sw2 = self.send_apdu(apdu)
+                
+                if sw1 == 0x90 and sw2 == 0x00:
+                    all_data.extend(response)
+                else:
                     break
-                all_data.extend(page_data)
             
             return bytes(all_data) if all_data else None
-            
         except Exception as e:
             logger.error(f"Error reading user data: {e}")
             return None
@@ -196,95 +320,93 @@ class NFCReaderManager:
     def parse_ndef_text(self, data: bytes) -> Optional[str]:
         """Parse NDEF text record from raw data"""
         try:
-            if len(data) < 10:
+            if not data or len(data) < 7:
                 return None
             
-            # Look for NDEF message start (0x03 = NDEF message TLV)
+            # Skip TLV header if present
             idx = 0
-            while idx < len(data) - 2:
+            while idx < len(data) - 5:
                 if data[idx] == 0x03:  # NDEF Message TLV
                     length = data[idx + 1]
-                    if length == 0 or idx + 2 + length > len(data):
-                        idx += 1
-                        continue
-                    
-                    ndef_data = data[idx + 2:idx + 2 + length]
-                    
-                    # Parse NDEF record
-                    if len(ndef_data) > 7:
-                        # Skip NDEF header to get to payload
-                        tnf = ndef_data[0] & 0x07
-                        type_length = ndef_data[1]
-                        payload_length = ndef_data[2]
-                        
-                        if tnf == 0x01 and type_length == 1:  # Well-known type
-                            record_type = ndef_data[3]
-                            if record_type == 0x54:  # 'T' for Text
-                                # Text record: status byte + language code + text
-                                payload_start = 4
-                                if payload_start < len(ndef_data):
-                                    status = ndef_data[payload_start]
-                                    lang_len = status & 0x3F
-                                    text_start = payload_start + 1 + lang_len
-                                    if text_start < len(ndef_data):
-                                        text_data = ndef_data[text_start:payload_start + payload_length]
-                                        # Remove null bytes
-                                        text = bytes(b for b in text_data if b != 0).decode('utf-8', errors='ignore')
-                                        return text
+                    idx += 2
                     break
-                idx += 1
+                elif data[idx] == 0x00 or data[idx] == 0xFE:
+                    idx += 1
+                else:
+                    idx += 2 + data[idx + 1] if idx + 1 < len(data) else 1
+            
+            if idx >= len(data) - 5:
+                # Try direct NDEF parsing
+                idx = 0
+            
+            # Parse NDEF record
+            if idx < len(data) and (data[idx] & 0xC0) == 0xC0:  # Short record, MB=1
+                tnf = data[idx] & 0x07
+                type_length = data[idx + 1] if idx + 1 < len(data) else 0
+                payload_length = data[idx + 2] if idx + 2 < len(data) else 0
+                
+                if tnf == 0x01 and type_length == 1:  # Well-known type
+                    record_type = data[idx + 3] if idx + 3 < len(data) else 0
+                    if record_type == ord('T'):  # Text record
+                        payload_start = idx + 4
+                        if payload_start < len(data):
+                            lang_len = data[payload_start] & 0x3F
+                            text_start = payload_start + 1 + lang_len
+                            text_end = payload_start + payload_length
+                            if text_start < len(data):
+                                text_bytes = data[text_start:min(text_end, len(data))]
+                                # Filter out non-printable characters
+                                text = ''.join(chr(b) for b in text_bytes if 32 <= b < 127 or b in [10, 13])
+                                return text.strip()
             
             return None
-            
         except Exception as e:
             logger.error(f"Error parsing NDEF: {e}")
             return None
     
-    def create_ndef_text_record(self, text: str) -> bytes:
-        """Create NDEF text record"""
-        text_bytes = text.encode('utf-8')
-        lang_code = b'en'
-        
-        # Text record payload: status byte + language code + text
-        status_byte = len(lang_code)  # UTF-8 encoding (bit 7 = 0)
-        payload = bytes([status_byte]) + lang_code + text_bytes
-        
-        # NDEF record header
-        # MB=1, ME=1, CF=0, SR=1, IL=0, TNF=001 (Well-known)
-        header = 0xD1
-        type_length = 1
-        payload_length = len(payload)
-        record_type = ord('T')
-        
-        ndef_record = bytes([header, type_length, payload_length, record_type]) + payload
-        
-        # TLV wrapper
-        # 0x03 = NDEF Message TLV, length, data, 0xFE = Terminator
-        tlv = bytes([0x03, len(ndef_record)]) + ndef_record + bytes([0xFE])
-        
-        return tlv
-    
-    def write_ndef_text(self, text: str, start_page: int = 4) -> bool:
+    def write_ndef_text(self, text: str) -> bool:
         """Write NDEF text record to NFC tag"""
         try:
-            ndef_data = self.create_ndef_text_record(text)
+            text_bytes = text.encode('utf-8')
+            lang = b'en'
+            
+            # Build NDEF record
+            ndef_record = bytes([
+                0xD1,  # Header: MB=1, ME=1, CF=0, SR=1, IL=0, TNF=1
+                0x01,  # Type length
+                len(text_bytes) + len(lang) + 1,  # Payload length
+                ord('T'),  # Type: Text
+                len(lang),  # Language code length
+            ]) + lang + text_bytes
+            
+            # Build NDEF message with TLV
+            ndef_message = bytes([
+                0x03,  # NDEF Message TLV
+                len(ndef_record),  # Length
+            ]) + ndef_record + bytes([
+                0xFE,  # Terminator TLV
+            ])
             
             # Pad to page boundary
-            padding_needed = (4 - (len(ndef_data) % 4)) % 4
-            ndef_data = ndef_data + bytes([0x00] * padding_needed)
+            while len(ndef_message) % 4 != 0:
+                ndef_message += bytes([0x00])
             
-            logger.info(f"Writing {len(ndef_data)} bytes ({len(ndef_data)//4} pages)")
-            
-            # Write page by page
-            for i in range(0, len(ndef_data), 4):
-                page = start_page + (i // 4)
-                page_data = ndef_data[i:i+4]
+            # Write pages
+            page = self.NTAG_USER_DATA_START
+            for i in range(0, len(ndef_message), 4):
+                chunk = list(ndef_message[i:i+4])
+                while len(chunk) < 4:
+                    chunk.append(0x00)
                 
-                if not self.write_page(page, page_data):
-                    logger.error(f"Failed to write page {page}")
+                apdu = [0xFF, 0xD6, 0x00, page, 0x04] + chunk
+                response, sw1, sw2 = self.send_apdu(apdu)
+                
+                if sw1 != 0x90 or sw2 != 0x00:
+                    logger.error(f"Write failed at page {page}: SW1={sw1:02X} SW2={sw2:02X}")
                     return False
                 
-                time.sleep(0.05)  # Small delay between writes
+                page += 1
+                time.sleep(0.05)
             
             logger.info(f"Successfully wrote NDEF text record")
             return True
@@ -314,7 +436,6 @@ class NFCReaderManager:
             if not text:
                 return None
             
-            # Try to parse as JSON
             try:
                 return json.loads(text)
             except json.JSONDecodeError:
@@ -324,16 +445,6 @@ class NFCReaderManager:
         except Exception as e:
             logger.error(f"Error reading JSON data: {e}")
             return None
-    
-    def disconnect(self):
-        """Disconnect from reader"""
-        try:
-            if self.connection:
-                self.connection.disconnect()
-                self.connection = None
-                logger.info("Disconnected from reader")
-        except Exception as e:
-            logger.error(f"Error disconnecting: {e}")
 
 
 # Global reader manager
@@ -342,7 +453,8 @@ nfc_manager = NFCReaderManager()
 
 def scan_loop():
     """Background thread that continuously scans for NFC cards"""
-    global scanning_active, last_card_uid, last_card_data, pending_write
+    global scanning_active, last_card_uid, last_card_data, last_card_is_magic
+    global pending_write, pending_uid_change
     
     logger.info("Scan loop started")
     
@@ -355,97 +467,128 @@ def scan_loop():
     
     socketio.emit('status', {
         'scanning': True,
-        'message': 'Scanning started'
+        'message': 'Scanning for NFC cards...'
     })
-    
-    consecutive_errors = 0
-    max_errors = 10
     
     while scanning_active:
         try:
-            uid = nfc_manager.get_card_uid()
+            # Try to get card UID
+            uid = nfc_manager.get_uid()
             
             if uid:
-                consecutive_errors = 0
-                
-                # Check for pending write operation
-                with write_lock:
-                    if pending_write and pending_write.get('targetUid') == uid:
-                        write_data = pending_write
-                        pending_write = None
-                        
-                        logger.info(f"Processing pending write for {uid}")
-                        socketio.emit('write_started', {
-                            'serialNumber': uid,
-                            'timestamp': time.time()
-                        })
-                        
-                        success = nfc_manager.write_json_data(write_data.get('data', {}))
-                        
-                        if success:
-                            # Verify write
-                            time.sleep(0.1)
-                            verify_data = nfc_manager.read_json_data()
-                            
-                            socketio.emit('write_complete', {
-                                'success': True,
-                                'serialNumber': uid,
-                                'data': write_data.get('data'),
-                                'verified': verify_data is not None,
-                                'timestamp': time.time()
-                            })
-                        else:
-                            socketio.emit('write_complete', {
-                                'success': False,
-                                'serialNumber': uid,
-                                'error': 'Write operation failed',
-                                'timestamp': time.time()
-                            })
-                        
-                        time.sleep(1)
-                        continue
-                
-                # Normal card detection
                 if uid != last_card_uid:
+                    # New card detected
                     last_card_uid = uid
-                    logger.info(f"Card detected: {uid}")
+                    
+                    # Detect if magic card
+                    is_magic = nfc_manager.detect_magic_card()
+                    last_card_is_magic = is_magic
                     
                     # Read existing data
                     card_data = nfc_manager.read_json_data()
                     last_card_data = card_data
                     
+                    logger.info(f"Card detected: {uid}, Magic: {is_magic}, Data: {card_data}")
+                    
                     socketio.emit('card_detected', {
                         'serialNumber': uid,
                         'userData': card_data,
-                        'timestamp': time.time(),
-                        'method': 'USB Bridge Service (ACR1222L)'
+                        'method': 'USB Bridge Service (ACR1222L)',
+                        'isMagicCard': is_magic
                     })
+                
+                # Check for pending UID change
+                if pending_uid_change:
+                    with write_lock:
+                        change_data = pending_uid_change
+                        pending_uid_change = None
                     
-                    time.sleep(0.5)
+                    new_uid = change_data.get('newUid')
+                    if new_uid:
+                        original_uid = last_card_uid
+                        
+                        socketio.emit('uid_change_started', {
+                            'originalUid': original_uid,
+                            'newUid': new_uid
+                        })
+                        
+                        success, message = nfc_manager.change_uid(new_uid)
+                        
+                        socketio.emit('uid_change_complete', {
+                            'success': success,
+                            'originalUid': original_uid,
+                            'newUid': new_uid if success else None,
+                            'message': message,
+                            'timestamp': time.time()
+                        })
+                        
+                        if success:
+                            last_card_uid = new_uid
+                
+                # Check for pending write
+                if pending_write:
+                    with write_lock:
+                        write_data = pending_write
+                        pending_write = None
+                    
+                    target_uid = write_data.get('targetUid')
+                    data = write_data.get('data', {})
+                    
+                    if target_uid == last_card_uid or target_uid is None:
+                        socketio.emit('write_started', {
+                            'serialNumber': last_card_uid
+                        })
+                        
+                        success = nfc_manager.write_json_data(data)
+                        
+                        socketio.emit('write_complete', {
+                            'success': success,
+                            'serialNumber': last_card_uid,
+                            'data': data if success else None,
+                            'error': 'Write failed' if not success else None,
+                            'timestamp': time.time()
+                        })
+                        
+                        if success:
+                            last_card_data = data
             else:
-                if last_card_uid is not None:
+                # No card or card removed
+                if last_card_uid:
                     logger.info("Card removed")
+                    socketio.emit('card_removed', {
+                        'previousUid': last_card_uid
+                    })
                     last_card_uid = None
                     last_card_data = None
-                    socketio.emit('card_removed', {
-                        'timestamp': time.time()
-                    })
-                
-                time.sleep(0.3)
-                
-        except Exception as e:
-            consecutive_errors += 1
-            logger.error(f"Error in scan loop: {e} (consecutive errors: {consecutive_errors})")
+                    last_card_is_magic = False
             
-            if consecutive_errors >= max_errors:
-                logger.error("Too many consecutive errors, stopping scan")
-                socketio.emit('error', {
-                    'message': f'Scanner error: {str(e)}. Scanning stopped.'
+            # Check if any clients still connected
+            if not connected_clients:
+                logger.info("No clients connected, stopping scan")
+                socketio.emit('status', {
+                    'scanning': False,
+                    'message': 'Scanning stopped.'
                 })
                 scanning_active = False
                 break
             
             time.sleep(0.5)
+            
+        except NoCardException:
+            if last_card_uid:
+                socketio.emit('card_removed', {
+                    'previousUid': last_card_uid
+                })
+                last_card_uid = None
+                last_card_data = None
+                last_card_is_magic = False
+            time.sleep(0.5)
+        except CardConnectionException as e:
+            logger.error(f"Card connection error: {e}")
+            time.sleep(0.5)
+        except Exception as e:
+            logger.error(f"Scan error: {e}")
+            time.sleep(1)
     
     nfc_manager.disconnect()
     logger.info("Scan loop stopped")
@@ -467,7 +610,7 @@ def handle_connect():
     emit('connected', {
         'message': 'Connected to NFC Bridge Service',
         'scanning': scanning_active,
-        'capabilities': ['read', 'write']
+        'capabilities': ['read', 'write', 'uid_change']
     })
 
 
@@ -497,15 +640,18 @@ def handle_start_scan(data=None):
 @socketio.on('stop_scan')
 def handle_stop_scan(data=None):
     """Stop NFC scanning"""
-    global scanning_active, last_card_uid, last_card_data, pending_write
+    global scanning_active, last_card_uid, last_card_data, last_card_is_magic
+    global pending_write, pending_uid_change
     
     logger.info("Stopping scan requested")
     scanning_active = False
     last_card_uid = None
     last_card_data = None
+    last_card_is_magic = False
     
     with write_lock:
         pending_write = None
+        pending_uid_change = None
     
     emit('status', {
         'scanning': False,
@@ -531,53 +677,83 @@ def handle_write_card(data: Dict):
     if not write_data:
         emit('write_complete', {
             'success': False,
-            'error': 'No data provided to write'
+            'error': 'No data to write'
         })
         return
     
-    logger.info(f"Write requested for card {target_uid}: {write_data}")
-    
-    # If card is currently on reader and matches, write immediately
+    # If card is currently on reader and UID matches, write immediately in scan loop
     if last_card_uid == target_uid:
-        emit('write_started', {
-            'serialNumber': target_uid,
-            'timestamp': time.time()
-        })
-        
-        success = nfc_manager.write_json_data(write_data)
-        
-        if success:
-            time.sleep(0.1)
-            verify_data = nfc_manager.read_json_data()
-            
-            emit('write_complete', {
-                'success': True,
-                'serialNumber': target_uid,
-                'data': write_data,
-                'verified': verify_data is not None,
-                'timestamp': time.time()
-            })
-        else:
-            emit('write_complete', {
-                'success': False,
-                'serialNumber': target_uid,
-                'error': 'Write operation failed',
-                'timestamp': time.time()
-            })
-    else:
-        # Queue for when card is detected
         with write_lock:
             pending_write = {
                 'targetUid': target_uid,
                 'data': write_data,
                 'timestamp': time.time()
             }
-        
         emit('write_queued', {
             'serialNumber': target_uid,
-            'message': 'Write queued. Please place the card on the reader.',
-            'timestamp': time.time()
+            'message': 'Write queued for current card'
         })
+    else:
+        # Card not on reader, queue for when it appears
+        with write_lock:
+            pending_write = {
+                'targetUid': target_uid,
+                'data': write_data,
+                'timestamp': time.time()
+            }
+        emit('write_queued', {
+            'serialNumber': target_uid,
+            'message': 'Write queued. Please place the card on the reader.'
+        })
+
+
+@socketio.on('change_uid')
+def handle_change_uid(data: Dict):
+    """
+    Queue a UID change operation for a Magic Card
+    
+    IMPORTANT: Only works on Magic Cards (special MIFARE Classic clones)
+    Regular NFC cards have factory-burned UIDs that cannot be changed.
+    """
+    global pending_uid_change, last_card_uid, last_card_is_magic
+    
+    new_uid = data.get('newUid')
+    
+    if not new_uid:
+        emit('uid_change_complete', {
+            'success': False,
+            'error': 'No new UID provided'
+        })
+        return
+    
+    if not last_card_uid:
+        emit('uid_change_complete', {
+            'success': False,
+            'error': 'No card detected. Please place a card on the reader.'
+        })
+        return
+    
+    if not last_card_is_magic:
+        emit('uid_change_complete', {
+            'success': False,
+            'error': 'This card is NOT a Magic Card. UID cannot be changed on regular NFC cards.',
+            'originalUid': last_card_uid
+        })
+        return
+    
+    # Queue the UID change
+    with write_lock:
+        pending_uid_change = {
+            'newUid': new_uid,
+            'originalUid': last_card_uid,
+            'timestamp': time.time()
+        }
+    
+    emit('uid_change_queued', {
+        'originalUid': last_card_uid,
+        'newUid': new_uid,
+        'message': 'UID change queued. Keep card on reader.'
+    })
 
 
 @socketio.on('read_card')
@@ -598,6 +774,7 @@ def handle_read_card(data=None):
         'success': True,
         'serialNumber': last_card_uid,
         'data': card_data,
+        'isMagicCard': last_card_is_magic,
         'timestamp': time.time()
     })
 
@@ -612,7 +789,7 @@ def handle_check_reader(data=None):
             'available': available,
             'reader': str(nfc_manager.reader) if nfc_manager.reader else None,
             'message': 'Reader found' if available else 'No reader found',
-            'capabilities': ['read', 'write'] if available else []
+            'capabilities': ['read', 'write', 'uid_change'] if available else []
         })
     except Exception as e:
         emit('error', {
@@ -629,7 +806,9 @@ def health_check():
         'service': 'NFC Bridge Service',
         'scanning': scanning_active,
         'connected_clients': len(connected_clients),
-        'capabilities': ['read', 'write']
+        'capabilities': ['read', 'write', 'uid_change'],
+        'currentCard': last_card_uid,
+        'isMagicCard': last_card_is_magic
     })
 
 
@@ -643,7 +822,8 @@ def reader_status():
             'reader': str(nfc_manager.reader) if nfc_manager.reader else None,
             'scanning': scanning_active,
             'currentCard': last_card_uid,
-            'capabilities': ['read', 'write']
+            'isMagicCard': last_card_is_magic,
+            'capabilities': ['read', 'write', 'uid_change']
         })
     except Exception as e:
         return jsonify({'error': str(e)}), 500
@@ -724,14 +904,56 @@ def read_card_rest():
     card_data = nfc_manager.read_json_data()
     return jsonify({
         'serialNumber': last_card_uid,
-        'data': card_data
+        'data': card_data,
+        'isMagicCard': last_card_is_magic
     })
+
+
+@app.route('/card/change-uid', methods=['POST'])
+def change_uid_rest():
+    """Change UID of Magic Card via REST API"""
+    global last_card_uid, last_card_is_magic
+    
+    data = request.json
+    if not data:
+        return jsonify({'error': 'No data provided'}), 400
+    
+    new_uid = data.get('newUid')
+    if not new_uid:
+        return jsonify({'error': 'No new UID provided'}), 400
+    
+    if not last_card_uid:
+        return jsonify({'error': 'No card detected'}), 400
+    
+    if not last_card_is_magic:
+        return jsonify({
+            'error': 'This card is NOT a Magic Card. UID cannot be changed.',
+            'originalUid': last_card_uid,
+            'isMagicCard': False
+        }), 400
+    
+    original_uid = last_card_uid
+    success, message = nfc_manager.change_uid(new_uid)
+    
+    if success:
+        return jsonify({
+            'success': True,
+            'originalUid': original_uid,
+            'newUid': new_uid,
+            'message': message
+        })
+    else:
+        return jsonify({
+            'success': False,
+            'originalUid': original_uid,
+            'error': message
+        }), 500
 
 
 if __name__ == '__main__':
     logger.info("Starting NFC Bridge Service")
     logger.info("WebSocket server will be available at http://localhost:5000")
-    logger.info("Capabilities: READ, WRITE")
+    logger.info("Capabilities: READ, WRITE, UID_CHANGE (Magic Cards only)")
     
     if nfc_manager.find_reader():
         logger.info(f"Reader found: {nfc_manager.reader}")

@@ -1,0 +1,606 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>USB NFC Bridge Test</title>
+    <script src="https://cdn.socket.io/4.7.2/socket.io.min.js"></script>
+    <style>
+        * {
+            box-sizing: border-box;
+            margin: 0;
+            padding: 0;
+        }
+        body {
+            font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, sans-serif;
+            background: #1a1a2e;
+            min-height: 100vh;
+            padding: 20px;
+            color: #fff;
+        }
+        .container {
+            max-width: 700px;
+            margin: 0 auto;
+        }
+        h1 {
+            text-align: center;
+            margin-bottom: 20px;
+            font-size: 1.5rem;
+            font-weight: 500;
+        }
+        .status-indicator {
+            display: flex;
+            align-items: center;
+            gap: 10px;
+            padding: 12px 16px;
+            border-radius: 8px;
+            margin-bottom: 15px;
+            font-size: 0.9rem;
+        }
+        .status-connected {
+            background: rgba(34, 197, 94, 0.15);
+            border: 1px solid rgba(34, 197, 94, 0.4);
+        }
+        .status-disconnected {
+            background: rgba(239, 68, 68, 0.15);
+            border: 1px solid rgba(239, 68, 68, 0.4);
+        }
+        .status-dot {
+            width: 10px;
+            height: 10px;
+            border-radius: 50%;
+        }
+        .status-connected .status-dot {
+            background: #22c55e;
+        }
+        .status-disconnected .status-dot {
+            background: #ef4444;
+        }
+        .card-display {
+            background: rgba(255, 255, 255, 0.03);
+            border: 1px dashed rgba(255, 255, 255, 0.2);
+            border-radius: 8px;
+            padding: 24px;
+            text-align: center;
+            margin-bottom: 20px;
+        }
+        .card-display.has-card {
+            border-color: #22c55e;
+            border-style: solid;
+        }
+        .card-display.is-magic {
+            border-color: #a855f7;
+        }
+        .card-label {
+            font-size: 0.75rem;
+            color: rgba(255, 255, 255, 0.5);
+            margin-bottom: 8px;
+            text-transform: uppercase;
+            letter-spacing: 1px;
+        }
+        .card-id {
+            font-family: 'Courier New', monospace;
+            font-size: 1.4rem;
+            font-weight: 600;
+            color: #22c55e;
+            word-break: break-all;
+        }
+        .card-id.no-card {
+            color: rgba(255, 255, 255, 0.3);
+            font-size: 0.9rem;
+            font-weight: 400;
+        }
+        .card-meta {
+            font-size: 0.8rem;
+            color: rgba(255, 255, 255, 0.5);
+            margin-top: 8px;
+        }
+        .card-badge {
+            display: inline-block;
+            padding: 4px 10px;
+            border-radius: 4px;
+            font-size: 0.7rem;
+            margin-top: 10px;
+        }
+        .badge-magic {
+            background: rgba(168, 85, 247, 0.2);
+            color: #c084fc;
+        }
+        .badge-standard {
+            background: rgba(255, 255, 255, 0.1);
+            color: rgba(255, 255, 255, 0.6);
+        }
+        .card-data {
+            margin-top: 15px;
+            padding: 12px;
+            background: rgba(0, 0, 0, 0.3);
+            border-radius: 6px;
+            text-align: left;
+        }
+        .card-data pre {
+            font-family: 'Courier New', monospace;
+            font-size: 0.75rem;
+            color: #60a5fa;
+            white-space: pre-wrap;
+            word-break: break-all;
+        }
+        .section {
+            background: rgba(255, 255, 255, 0.03);
+            border: 1px solid rgba(255, 255, 255, 0.1);
+            border-radius: 8px;
+            padding: 16px;
+            margin-bottom: 16px;
+        }
+        .section-title {
+            font-size: 0.85rem;
+            font-weight: 500;
+            margin-bottom: 12px;
+            color: rgba(255, 255, 255, 0.8);
+        }
+        .button-group {
+            display: flex;
+            flex-wrap: wrap;
+            gap: 8px;
+        }
+        .button {
+            padding: 10px 16px;
+            border: none;
+            border-radius: 6px;
+            font-size: 0.85rem;
+            font-weight: 500;
+            cursor: pointer;
+            transition: opacity 0.2s;
+        }
+        .button:disabled {
+            opacity: 0.4;
+            cursor: not-allowed;
+        }
+        .button:hover:not(:disabled) {
+            opacity: 0.85;
+        }
+        .button-primary {
+            background: #3b82f6;
+            color: white;
+        }
+        .button-success {
+            background: #22c55e;
+            color: white;
+        }
+        .button-purple {
+            background: #a855f7;
+            color: white;
+        }
+        .button-danger {
+            background: #ef4444;
+            color: white;
+        }
+        .button-secondary {
+            background: rgba(255, 255, 255, 0.1);
+            color: white;
+        }
+        .input-group {
+            margin-bottom: 12px;
+        }
+        .input-group label {
+            display: block;
+            font-size: 0.8rem;
+            color: rgba(255, 255, 255, 0.6);
+            margin-bottom: 6px;
+        }
+        .input-group input,
+        .input-group textarea {
+            width: 100%;
+            padding: 10px 12px;
+            border: 1px solid rgba(255, 255, 255, 0.15);
+            border-radius: 6px;
+            background: rgba(255, 255, 255, 0.05);
+            color: white;
+            font-family: 'Courier New', monospace;
+            font-size: 0.85rem;
+        }
+        .input-group input:focus,
+        .input-group textarea:focus {
+            outline: none;
+            border-color: rgba(255, 255, 255, 0.3);
+        }
+        .section-magic {
+            border-color: rgba(168, 85, 247, 0.3);
+        }
+        .warning-text {
+            font-size: 0.75rem;
+            color: #f59e0b;
+            margin-top: 8px;
+        }
+        .hint-text {
+            font-size: 0.75rem;
+            color: rgba(255, 255, 255, 0.4);
+            margin-bottom: 12px;
+        }
+        .log-container {
+            background: #0d1117;
+            border-radius: 8px;
+            padding: 12px;
+            max-height: 300px;
+            overflow-y: auto;
+        }
+        .log-entry {
+            font-family: 'Courier New', monospace;
+            font-size: 0.75rem;
+            padding: 4px 0;
+            border-bottom: 1px solid rgba(255, 255, 255, 0.05);
+            display: flex;
+            gap: 10px;
+        }
+        .log-entry:last-child {
+            border-bottom: none;
+        }
+        .log-time {
+            color: rgba(255, 255, 255, 0.3);
+            flex-shrink: 0;
+        }
+        .log-message {
+            color: rgba(255, 255, 255, 0.7);
+        }
+        .log-entry.success .log-message { color: #22c55e; }
+        .log-entry.error .log-message { color: #ef4444; }
+        .log-entry.warning .log-message { color: #f59e0b; }
+        .log-entry.purple .log-message { color: #c084fc; }
+        .reader-info {
+            font-size: 0.8rem;
+            color: rgba(255, 255, 255, 0.6);
+            margin-bottom: 15px;
+            padding: 10px 12px;
+            background: rgba(59, 130, 246, 0.1);
+            border-radius: 6px;
+        }
+    </style>
+</head>
+<body>
+    <div class="container">
+        <h1>USB NFC Bridge Test</h1>
+
+        <div id="connectionStatus" class="status-indicator status-disconnected">
+            <div class="status-dot"></div>
+            <span>Disconnected from bridge service</span>
+        </div>
+
+        <div id="readerInfo" class="reader-info" style="display: none;">
+            Reader: <span id="readerName">-</span>
+        </div>
+
+        <div class="card-display" id="cardDisplay">
+            <div class="card-label">NFC Card</div>
+            <div class="card-id no-card" id="cardId">No card detected</div>
+            <div class="card-meta" id="cardMeta"></div>
+            <div id="cardBadge"></div>
+            <div class="card-data" id="cardData" style="display: none;">
+                <pre id="cardDataContent"></pre>
+            </div>
+        </div>
+
+        <div class="section">
+            <div class="section-title">Scan Controls</div>
+            <div class="button-group">
+                <button id="startBtn" class="button button-primary" onclick="startScan()" disabled>Start Scan</button>
+                <button id="stopBtn" class="button button-danger" onclick="stopScan()" disabled>Stop</button>
+                <button id="checkBtn" class="button button-secondary" onclick="checkReader()" disabled>Check Reader</button>
+                <button id="readBtn" class="button button-secondary" onclick="readCard()" disabled>Read Data</button>
+            </div>
+        </div>
+
+        <div class="section">
+            <div class="section-title">Write to Card</div>
+            <div class="input-group">
+                <label>Data (JSON)</label>
+                <textarea id="writeData" rows="2" placeholder='{"userId": "123", "userName": "John"}'></textarea>
+            </div>
+            <button id="writeBtn" class="button button-success" onclick="writeCard()" disabled>Write</button>
+        </div>
+
+        <div class="section section-magic">
+            <div class="section-title">UID Change (Magic Cards Only)</div>
+            <p class="hint-text">Only Magic Cards support UID modification. Standard cards have factory-burned UIDs.</p>
+            <div class="input-group">
+                <label>New UID (format: XX:XX:XX:XX)</label>
+                <input type="text" id="newUid" placeholder="AB:CD:EF:12" maxlength="11">
+            </div>
+            <button id="changeUidBtn" class="button button-purple" onclick="changeUid()" disabled>Change UID</button>
+            <p id="magicCardWarning" class="warning-text" style="display: none;">Current card is not a Magic Card</p>
+        </div>
+
+        <div class="section">
+            <div class="section-title">Activity Log</div>
+            <div class="log-container">
+                <div id="logContent">
+                    <div class="log-entry">
+                        <span class="log-time">--:--:--</span>
+                        <span class="log-message">Waiting for connection...</span>
+                    </div>
+                </div>
+            </div>
+        </div>
+    </div>
+
+    <script>
+        let socket = null;
+        let isScanning = false;
+        let currentCardUid = null;
+        let isMagicCard = false;
+
+        document.addEventListener('DOMContentLoaded', () => {
+            connectToBridge();
+        });
+
+        function connectToBridge() {
+            addLog('Connecting to bridge service...');
+            
+            socket = io('http://localhost:5000', {
+                transports: ['websocket', 'polling'],
+                reconnection: true,
+                reconnectionDelay: 1000,
+                reconnectionAttempts: 10
+            });
+
+            socket.on('connect', () => {
+                addLog('Connected to bridge service', 'success');
+                updateConnectionStatus(true);
+                enableButtons(true);
+            });
+
+            socket.on('disconnect', () => {
+                addLog('Disconnected from bridge service', 'error');
+                updateConnectionStatus(false);
+                enableButtons(false);
+                isScanning = false;
+                updateScanningStatus(false);
+            });
+
+            socket.on('connect_error', (error) => {
+                addLog('Connection error: ' + error.message, 'error');
+            });
+
+            socket.on('connected', (data) => {
+                addLog('Bridge: ' + data.message, 'success');
+            });
+
+            socket.on('status', (data) => {
+                addLog('Status: ' + data.message);
+                isScanning = data.scanning;
+                updateScanningStatus(data.scanning);
+            });
+
+            socket.on('card_detected', (data) => {
+                currentCardUid = data.serialNumber;
+                isMagicCard = data.isMagicCard || false;
+                
+                const cardType = isMagicCard ? 'Magic Card' : 'Standard';
+                addLog('Card detected: ' + data.serialNumber + ' (' + cardType + ')', 'success');
+                
+                updateCardDisplay(data.serialNumber, data.method, isMagicCard, data.userData);
+                updateMagicCardUI(isMagicCard);
+                
+                document.getElementById('writeBtn').disabled = false;
+                document.getElementById('readBtn').disabled = false;
+            });
+
+            socket.on('card_removed', () => {
+                addLog('Card removed', 'warning');
+                clearCardDisplay();
+                currentCardUid = null;
+                isMagicCard = false;
+                updateMagicCardUI(false);
+                document.getElementById('writeBtn').disabled = true;
+                document.getElementById('changeUidBtn').disabled = true;
+            });
+
+            socket.on('reader_status', (data) => {
+                if (data.available) {
+                    addLog('Reader: ' + data.reader, 'success');
+                    document.getElementById('readerInfo').style.display = 'block';
+                    document.getElementById('readerName').textContent = data.reader;
+                } else {
+                    addLog('No reader found', 'error');
+                    document.getElementById('readerInfo').style.display = 'none';
+                }
+            });
+
+            socket.on('write_started', () => {
+                addLog('Writing...');
+            });
+
+            socket.on('write_queued', (data) => {
+                addLog('Write queued: ' + data.message);
+            });
+
+            socket.on('write_complete', (data) => {
+                if (data.success) {
+                    addLog('Write successful', 'success');
+                } else {
+                    addLog('Write failed: ' + (data.error || 'Unknown error'), 'error');
+                }
+            });
+
+            socket.on('read_complete', (data) => {
+                if (data.success) {
+                    addLog('Read successful', 'success');
+                    if (data.data) {
+                        updateCardData(data.data);
+                    }
+                } else {
+                    addLog('Read failed: ' + data.error, 'error');
+                }
+            });
+
+            socket.on('uid_change_started', (data) => {
+                addLog('UID change: ' + data.originalUid + ' -> ' + data.newUid, 'purple');
+            });
+
+            socket.on('uid_change_queued', (data) => {
+                addLog('UID change queued', 'purple');
+            });
+
+            socket.on('uid_change_complete', (data) => {
+                if (data.success) {
+                    addLog('UID changed: ' + data.originalUid + ' -> ' + data.newUid, 'success');
+                    currentCardUid = data.newUid;
+                    updateCardDisplay(data.newUid, 'UID Changed', isMagicCard, null);
+                } else {
+                    addLog('UID change failed: ' + (data.error || data.message), 'error');
+                }
+            });
+
+            socket.on('error', (data) => {
+                addLog('Error: ' + data.message, 'error');
+            });
+        }
+
+        function startScan() {
+            if (!socket?.connected) return;
+            addLog('Starting scan...');
+            socket.emit('start_scan');
+            isScanning = true;
+            updateScanningStatus(true);
+        }
+
+        function stopScan() {
+            if (!socket?.connected) return;
+            addLog('Stopping scan...');
+            socket.emit('stop_scan');
+            isScanning = false;
+            updateScanningStatus(false);
+        }
+
+        function checkReader() {
+            if (!socket?.connected) return;
+            addLog('Checking reader...');
+            socket.emit('check_reader');
+        }
+
+        function readCard() {
+            if (!socket?.connected) return;
+            addLog('Reading card...');
+            socket.emit('read_card');
+        }
+
+        function writeCard() {
+            if (!socket?.connected) return;
+
+            const dataInput = document.getElementById('writeData').value.trim();
+            if (!dataInput) {
+                addLog('Enter data to write', 'warning');
+                return;
+            }
+
+            let data;
+            try {
+                data = JSON.parse(dataInput);
+            } catch (e) {
+                addLog('Invalid JSON', 'error');
+                return;
+            }
+
+            addLog('Writing to card...');
+            socket.emit('write_card', { serialNumber: currentCardUid, data: data });
+        }
+
+        function changeUid() {
+            if (!socket?.connected) return;
+
+            if (!isMagicCard) {
+                addLog('Cannot change UID: Not a Magic Card', 'error');
+                return;
+            }
+
+            const newUid = document.getElementById('newUid').value.trim().toUpperCase();
+            if (!newUid) {
+                addLog('Enter new UID', 'warning');
+                return;
+            }
+
+            const uidRegex = /^[0-9A-F]{2}:[0-9A-F]{2}:[0-9A-F]{2}:[0-9A-F]{2}$/;
+            if (!uidRegex.test(newUid)) {
+                addLog('Invalid UID format (use XX:XX:XX:XX)', 'error');
+                return;
+            }
+
+            addLog('Changing UID to ' + newUid + '...', 'purple');
+            socket.emit('change_uid', { newUid: newUid });
+        }
+
+        function updateConnectionStatus(connected) {
+            const el = document.getElementById('connectionStatus');
+            el.className = 'status-indicator ' + (connected ? 'status-connected' : 'status-disconnected');
+            el.innerHTML = '<div class="status-dot"></div><span>' + 
+                (connected ? 'Connected to bridge service' : 'Disconnected from bridge service') + '</span>';
+        }
+
+        function updateScanningStatus(scanning) {
+            document.getElementById('startBtn').disabled = scanning;
+            document.getElementById('stopBtn').disabled = !scanning;
+            document.getElementById('startBtn').textContent = scanning ? 'Scanning...' : 'Start Scan';
+        }
+
+        function enableButtons(enabled) {
+            document.getElementById('startBtn').disabled = !enabled;
+            document.getElementById('checkBtn').disabled = !enabled;
+            document.getElementById('stopBtn').disabled = true;
+            document.getElementById('writeBtn').disabled = true;
+            document.getElementById('readBtn').disabled = !enabled || !currentCardUid;
+            document.getElementById('changeUidBtn').disabled = true;
+        }
+
+        function updateCardDisplay(uid, method, isMagic, userData) {
+            const display = document.getElementById('cardDisplay');
+            const cardIdEl = document.getElementById('cardId');
+            const metaEl = document.getElementById('cardMeta');
+            const badgeEl = document.getElementById('cardBadge');
+            
+            display.className = 'card-display has-card' + (isMagic ? ' is-magic' : '');
+            cardIdEl.textContent = uid;
+            cardIdEl.className = 'card-id';
+            metaEl.textContent = method || '';
+            
+            badgeEl.innerHTML = '<span class="card-badge ' + (isMagic ? 'badge-magic' : 'badge-standard') + '">' +
+                (isMagic ? 'Magic Card' : 'Standard Card') + '</span>';
+
+            if (userData) updateCardData(userData);
+        }
+
+        function updateCardData(data) {
+            document.getElementById('cardData').style.display = 'block';
+            document.getElementById('cardDataContent').textContent = JSON.stringify(data, null, 2);
+        }
+
+        function clearCardDisplay() {
+            document.getElementById('cardDisplay').className = 'card-display';
+            document.getElementById('cardId').textContent = 'No card detected';
+            document.getElementById('cardId').className = 'card-id no-card';
+            document.getElementById('cardMeta').textContent = '';
+            document.getElementById('cardBadge').innerHTML = '';
+            document.getElementById('cardData').style.display = 'none';
+        }
+
+        function updateMagicCardUI(isMagic) {
+            document.getElementById('changeUidBtn').disabled = !isMagic || !currentCardUid;
+            document.getElementById('magicCardWarning').style.display = 
+                (currentCardUid && !isMagic) ? 'block' : 'none';
+        }
+
+        function addLog(message, type = '') {
+            const logContent = document.getElementById('logContent');
+            const time = new Date().toLocaleTimeString();
+            
+            const entry = document.createElement('div');
+            entry.className = 'log-entry' + (type ? ' ' + type : '');
+            entry.innerHTML = '<span class="log-time">' + time + '</span>' +
+                '<span class="log-message">' + message + '</span>';
+            
+            logContent.insertBefore(entry, logContent.firstChild);
+            
+            while (logContent.children.length > 100) {
+                logContent.removeChild(logContent.lastChild);
+            }
+        }
+    </script>
+</body>
+</html>
